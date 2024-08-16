@@ -1,43 +1,94 @@
 import sympy as sp
-from sympy.parsing.sympy_parser import parse_expr, standard_transformations, implicit_multiplication_application
+from sympy.parsing.sympy_parser import parse_expr, standard_transformations, implicit_multiplication_application, TokenError
 from typing import Union, Dict, Any, List
 import re
 from sympy.physics.units import Unit, Quantity
 from sympy.physics.units.systems import SI
 from sympy.physics.units.systems.si import dimsys_SI
+import logging
 
 class CommunicationLayer:
     def __init__(self):
         self.transformations = standard_transformations + (implicit_multiplication_application,)
         self.symbol_map = {}
-        self.unit_system = SI
+        self.logger = self._setup_logger()
+
+    def _setup_logger(self):
+        logger = logging.getLogger(__name__)
+        logger.setLevel(logging.DEBUG)
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+        return logger
 
     def neural_to_symbolic(self, neural_output: str) -> sp.Expr:
+        self.logger.debug(f"Converting to symbolic: {neural_output[:100]}...")
+        
+        # Try to find the original equation in the text
+        equation_match = re.search(r'([x\^2+\-*/0-9\s]+=[x\^2+\-*/0-9\s]+)', neural_output)
+        if equation_match:
+            equation = equation_match.group(1)
+            self.logger.debug(f"Found equation: {equation}")
+            try:
+                # Convert equation to expression by moving everything to one side
+                left, right = equation.split('=')
+                expr = f"({left})-({right})"
+                self.logger.debug(f"Parsing expression: {expr}")
+                return parse_expr(expr, transformations=self.transformations, local_dict=self.symbol_map)
+            except Exception as e:
+                self.logger.error(f"Failed to parse equation: {str(e)}")
+        
+        # If we can't find the equation, fall back to the original method
         cleaned_output = self.parse_and_clean(neural_output)
-        try:
-            symbolic_expr = parse_expr(cleaned_output, transformations=self.transformations, local_dict=self.symbol_map)
-            return symbolic_expr
-        except Exception as e:
-            raise ValueError(f"Failed to convert neural output to symbolic expression: {e}")
+        self.logger.debug(f"Cleaned output: {cleaned_output}")
 
-    def symbolic_to_neural(self, symbolic_output: Union[sp.Expr, str]) -> str:
-        if isinstance(symbolic_output, str):
-            return symbolic_output
         try:
-            neural_input = sp.pretty(symbolic_output)
-            return neural_input
+            math_expr = re.search(r'([x+\-*/^()0-9=\s]+)', cleaned_output)
+            if math_expr:
+                expr_to_parse = math_expr.group(1).replace('=', '-')
+                self.logger.debug(f"Attempting to parse expression: {expr_to_parse}")
+                return parse_expr(expr_to_parse, transformations=self.transformations, local_dict=self.symbol_map)
+            else:
+                raise ValueError("No valid mathematical expression found in the output")
         except Exception as e:
-            raise ValueError(f"Failed to convert symbolic output to neural input: {e}")
+            self.logger.error(f"Failed to parse expression: {str(e)}")
+            self.logger.warning("Returning default symbol 'x' as fallback")
+            return sp.Symbol('x')
 
     def parse_and_clean(self, text: str) -> str:
+        # Remove any text enclosed in parentheses (often explanatory text)
+        text = re.sub(r'\([^)]*\)', '', text)
         text = text.replace('^', '**')  # Convert caret to Python exponentiation
         text = re.sub(r'(\d+)([a-zA-Z])', r'\1*\2', text)  # Add multiplication sign between numbers and variables
-        text = text.replace('=', '-')  # Convert equations to expressions
-        text = re.sub(r'\b(and|AND)\b', '&', text)  # Convert 'and' to '&' for logical operations
-        text = re.sub(r'\b(or|OR)\b', '|', text)  # Convert 'or' to '|' for logical operations
-        text = re.sub(r'\b(not|NOT)\b', '~', text)  # Convert 'not' to '~' for logical operations
-        return text
+        # Remove any non-mathematical text, but keep '='
+        text = re.sub(r'[a-zA-Z]+', '', text)
+        return text.strip()
 
+    def _is_valid_expression(self, expr: str) -> bool:
+        # Basic validation to check if the expression looks valid
+        if expr.count('(') != expr.count(')'):
+            return False  # Unbalanced parentheses
+        if re.search(r'[^0-9x+\-*/^()]', expr):
+            return False  # Invalid characters
+        if re.search(r'[\-+*/^]{2,}', expr):
+            return False  # Consecutive operators
+        return True
+
+
+
+    def _is_valid_expression(self, expr: str) -> bool:
+        # Basic validation to check if the expression looks valid
+        if expr.count('(') != expr.count(')'):
+            return False  # Unbalanced parentheses
+        if re.search(r'[^0-9x+\-*/^()]', expr):
+            return False  # Invalid characters
+        if re.search(r'[\-+*/^]{2,}', expr):
+            return False  # Consecutive operators
+        return True
+
+    
     def register_symbol(self, symbol_name: str, sympy_symbol: sp.Symbol) -> None:
         self.symbol_map[symbol_name] = sympy_symbol
 
@@ -45,8 +96,7 @@ class CommunicationLayer:
         return self.symbol_map.get(symbol_name)
 
     def extract_equations(self, text: str) -> List[str]:
-        equations = re.findall(r'([^=]+=[^=]+)', text)
-        return [eq.strip() for eq in equations]
+        return [eq.strip() for eq in re.findall(r'([^=]+=[^=]+)', text)]
 
     def extract_variables(self, expr: Union[sp.Expr, str]) -> set:
         if isinstance(expr, str):
@@ -59,19 +109,18 @@ class CommunicationLayer:
             to_quantity = from_quantity.convert_to(Unit(to_unit))
             return float(sp.N(to_quantity.evalf()))
         except Exception as e:
+            self.logger.error(f"Failed to convert units: {e}")
             raise ValueError(f"Failed to convert units: {e}")
 
     def format_solution(self, solution: Dict[sp.Symbol, Any]) -> str:
-        formatted = []
-        for var, value in solution.items():
-            formatted.append(f"{var} = {value}")
-        return ", ".join(formatted)
+        return ", ".join(f"{var} = {value}" for var, value in solution.items())
 
     def parse_inequality(self, inequality_str: str) -> sp.Rel:
-        inequality_str = self.parse_and_clean(inequality_str)
         try:
+            inequality_str = self.parse_and_clean(inequality_str)
             return sp.parsing.sympy_parser.parse_expr(inequality_str, transformations=self.transformations, evaluate=False)
         except Exception as e:
+            self.logger.error(f"Failed to parse inequality: {e}")
             raise ValueError(f"Failed to parse inequality: {e}")
 
     def symbolic_to_latex(self, symbolic_expr: Union[sp.Expr, str]) -> str:
@@ -80,11 +129,11 @@ class CommunicationLayer:
         return sp.latex(symbolic_expr)
 
     def solve_system_of_equations(self, equations: List[Union[sp.Expr, str]]) -> Dict[sp.Symbol, Any]:
-        symbolic_equations = [self.neural_to_symbolic(eq) if isinstance(eq, str) else eq for eq in equations]
         try:
-            solution = sp.solve(symbolic_equations)
-            return solution
+            symbolic_equations = [self.neural_to_symbolic(eq) if isinstance(eq, str) else eq for eq in equations]
+            return sp.solve(symbolic_equations)
         except Exception as e:
+            self.logger.error(f"Failed to solve system of equations: {e}")
             raise ValueError(f"Failed to solve system of equations: {e}")
 
     def simplify_expression(self, expr: Union[sp.Expr, str]) -> sp.Expr:
@@ -145,10 +194,11 @@ class CommunicationLayer:
         return expr.subs(dimsys_SI.get_dimensional_dependencies(expr))
 
     def solve_linear_system(self, matrix_A: List[List[float]], vector_b: List[float]) -> List[float]:
-        A = sp.Matrix(matrix_A)
-        b = sp.Matrix(vector_b)
         try:
+            A = sp.Matrix(matrix_A)
+            b = sp.Matrix(vector_b)
             solution = A.LUsolve(b)
             return [float(sol) for sol in solution]
         except Exception as e:
+            self.logger.error(f"Failed to solve linear system: {e}")
             raise ValueError(f"Failed to solve linear system: {e}")
